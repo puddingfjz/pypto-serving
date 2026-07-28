@@ -25,6 +25,11 @@ import torch
 from pypto_serving.config.types import RuntimeModel
 from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as CorePyptoExecutor
 from pypto_serving.model.common.runner.model_runner import ModelRunner
+from pypto_serving.model.deepseek.kernel_cache import (
+    KernelCache,
+    compute_code_fingerprint,
+    compute_params_fingerprint,
+)
 from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_CSA_INNER_OUT_DIM,
     DEEPSEEK_V4_CSA_INNER_STATE_DIM,
@@ -295,6 +300,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         compile_kernels: bool = False,
         enable_mtp: bool = False,
         l3_trace: bool = False,
+        kernel_cache_dir: str | None = None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -311,6 +317,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         self._enable_mtp = bool(enable_mtp)
         self._l3_trace = l3_trace
         self._embedding_cache: dict[str, torch.Tensor] = {}
+        self._kernel_cache = (
+            KernelCache(kernel_cache_dir, compute_code_fingerprint(pypto_root))
+            if kernel_cache_dir
+            else None
+        )
 
     @property
     def profile_verbose(self) -> bool:
@@ -367,7 +378,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         """Create the DeepSeekV4 runtime runner."""
         if not isinstance(compiled, DeepSeekV4CompiledKernels):
             raise TypeError("DeepSeekV4PyptoExecutor requires DeepSeekV4 compiled metadata.")
-        return DeepSeekV4ModelRunner(compiled=compiled)
+        return DeepSeekV4ModelRunner(compiled=compiled, kernel_cache=self._kernel_cache)
 
     def _compile_model(self, model: RuntimeModel) -> DeepSeekV4CompiledKernels:
         """Validate DeepSeekV4 W8A8 metadata and return runner artifacts.
@@ -571,6 +582,25 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             device_ids=list(self._device_ids),
             num_sub_workers=0,
         )
+        params_fingerprint = compute_params_fingerprint(
+            name,
+            dummy_args,
+            platform=self._platform,
+            block_dim=getattr(distributed_config, "block_dim", None),
+        )
+        if self._kernel_cache is not None:
+            cached = self._kernel_cache.load(
+                name,
+                params_fingerprint,
+                platform=self._platform,
+                distributed_config=distributed_config,
+            )
+            if cached is not None:
+                return DeepSeekV4L3Callable(
+                    compiled=cached,
+                    name=name,
+                    params_fingerprint=params_fingerprint,
+                )
         run_config = RunConfig(
             platform=config.platform,
             device_id=config.device_id,
@@ -590,7 +620,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             compiled = jit_fn.compile(*dummy_args, config=run_config)
         if not isinstance(compiled, DistributedCompiledProgram):
             raise TypeError(f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}")
-        return DeepSeekV4L3Callable(compiled=compiled, name=name)
+        return DeepSeekV4L3Callable(
+            compiled=compiled,
+            name=name,
+            params_fingerprint=params_fingerprint,
+        )
 
     @staticmethod
     def _compile_cache_blocks(

@@ -153,6 +153,7 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
             "--max-model-len", "260",
             "--dtype", "int8",
             "--enable-mtp",
+            "--kernel-cache-dir", str(tmp_path / "kernel-cache"),
         ]
     )
 
@@ -165,6 +166,7 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
     assert config.runtime_config.weight_dtype == "int8"
     assert config.enable_prefix_cache is False
     assert config.executor_kwargs["enable_mtp"] is True
+    assert config.executor_kwargs["kernel_cache_dir"] == str((tmp_path / "kernel-cache").resolve())
 
 
 def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_path, monkeypatch):
@@ -426,6 +428,44 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert decode_args[decode_order.index("swa_lens")].shape == (8, 8)
     assert decode_args[decode_order.index("window_swa_indices")].shape == (8, 8, 128)
     assert decode_args[decode_order.index("window_swa_lens")].shape == (8, 8)
+
+
+def test_deepseek_compile_l3_callable_reuses_cached_program():
+    cached = object()
+    captured = {}
+
+    class FakeCache:
+        def load(self, name, params_fingerprint, *, platform, distributed_config):
+            captured.update(
+                name=name,
+                params_fingerprint=params_fingerprint,
+                platform=platform,
+                distributed_config=distributed_config,
+            )
+            return cached
+
+    class FakeJit:
+        def compile(self, *_args, **_kwargs):
+            raise AssertionError("cache hit must skip JIT compilation")
+
+    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(
+        npu_executor.DeepSeekV4PyptoExecutor
+    )
+    executor._device_ids = tuple(range(8))
+    executor._platform = "a2a3"
+    executor._kernel_cache = FakeCache()
+    executor._run_config = lambda *, codegen_only: object()
+
+    callable_spec = executor._compile_l3_callable(
+        "deepseek_v4_decode",
+        FakeJit(),
+        (torch.empty((8, 4), dtype=torch.bfloat16),),
+    )
+
+    assert callable_spec.compiled is cached
+    assert callable_spec.params_fingerprint == captured["params_fingerprint"]
+    assert captured["name"] == "deepseek_v4_decode"
+    assert captured["platform"] == "a2a3"
 
 
 def test_deepseek_kernel_contract_rejects_config_dimension_mismatch(tmp_path):
@@ -732,21 +772,42 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     compiled_program = object()
     captured = {}
 
+    class FakeKernelCache:
+        def store(self, name, compiled, params_fingerprint):
+            captured["stored"] = (name, compiled, params_fingerprint)
+
     class FakeDistributedWorker:
-        def __init__(self, compiled, *, persistent, inherited_host_tensors):
+        def __init__(
+            self,
+            compiled,
+            *,
+            persistent,
+            reset_persistent_windows,
+            inherited_host_tensors,
+        ):
             captured["compiled"] = compiled
             captured["persistent"] = persistent
+            captured["reset_persistent_windows"] = reset_persistent_windows
             captured["inherited"] = inherited_host_tensors
 
     monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
     runner._l3_worker = None
+    runner._kernel_cache = FakeKernelCache()
     runner._stacked_host_weights = {"main": main_weight}
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._compiled = type(
         "Compiled",
         (),
-        {"l3_callables": lambda _self: (DeepSeekV4L3Callable(compiled_program, "decode"),)},
+        {
+            "l3_callables": lambda _self: (
+                DeepSeekV4L3Callable(
+                    compiled_program,
+                    "decode",
+                    params_fingerprint="params",
+                ),
+            )
+        },
     )()
     runner._assert_l3_shared_buffers_preallocated = lambda: None
 
@@ -755,7 +816,9 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     assert isinstance(worker, FakeDistributedWorker)
     assert captured["compiled"] == [compiled_program]
     assert captured["persistent"] is True
+    assert captured["reset_persistent_windows"] is False
     assert captured["inherited"] == [main_weight, mtp_weight]
+    assert captured["stored"] == ("decode", compiled_program, "params")
 
 
 def test_deepseek_resident_upload_releases_inherited_host_references():

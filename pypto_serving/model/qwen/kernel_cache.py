@@ -33,50 +33,20 @@ falls back to a fresh compile.
 
 from __future__ import annotations
 
-import ast
 import functools
 import hashlib
-import logging
-import os
-import shutil
 from pathlib import Path
 from typing import Any, Sequence
 
-logger = logging.getLogger(__name__)
-
-#: Marker file in each slot: ``<code_fp>|<params_fp>`` the slot was built with.
-FINGERPRINT_FILE = "fingerprint.txt"
-#: Emitted by the pypto compiler; its presence tells us a slot holds a program.
-META_FILE = "distributed_meta.json"
-#: Sentinel for a fingerprint that could not be computed. It must never compare
-#: equal to another sentinel, or genuinely different kernels would collide.
-UNKNOWN = "unknown"
-
-
-def canonical_source(src: str) -> bytes:
-    """Return a formatting-insensitive canonical form of Python source.
-
-    Hashing this instead of the raw bytes means cosmetic edits -- blank lines,
-    comments, reindentation, spacing -- do NOT invalidate the cache, while any
-    change to the parsed program does. Uses the AST (``include_attributes`` off,
-    so line/column numbers are excluded); a naive text minify cannot do this
-    safely because indentation and keyword/identifier separators are load
-    bearing in Python. Falls back to raw bytes for source that does not parse (a
-    syntactically broken kernel would not compile anyway).
-    """
-    try:
-        return ast.dump(ast.parse(src), include_attributes=False).encode()
-    except SyntaxError:
-        return src.encode()
-
-
-def _pypto_version() -> str:
-    try:
-        import pypto  # noqa: PLC0415
-
-        return str(getattr(pypto, "__version__", UNKNOWN))
-    except Exception:  # noqa: BLE001 - version probe must never be fatal
-        return UNKNOWN
+from pypto_serving.model.common.kernel_cache import (
+    FINGERPRINT_FILE as FINGERPRINT_FILE,
+    META_FILE as META_FILE,
+    UNKNOWN,
+    KernelCache as KernelCache,
+    canonical_source as canonical_source,
+    pypto_version,
+    source_fingerprint,
+)
 
 
 @functools.lru_cache(maxsize=None)
@@ -94,7 +64,6 @@ def compute_code_fingerprint(pypto_root: str | None) -> str:
     Any probe failure degrades to a marker containing ``UNKNOWN``, which the
     cache treats as a permanent MISS, forcing a safe recompile.
     """
-    version = _pypto_version()
     try:
         # Imported lazily to avoid a module import cycle (npu_executor imports
         # this module at top level) and to keep this module torch-free.
@@ -110,13 +79,9 @@ def compute_code_fingerprint(pypto_root: str | None) -> str:
         if dispatch.is_file():
             sources.append((dispatch.name, dispatch))
 
-        digest = hashlib.sha256()
-        for rel, path in sorted(sources):
-            digest.update(rel.encode())
-            digest.update(canonical_source(path.read_text(encoding="utf-8", errors="surrogateescape")))
-        return f"{version}+{digest.hexdigest()[:16]}"
+        return source_fingerprint(sources)
     except Exception:  # noqa: BLE001 - fingerprint must never be fatal
-        return f"{version}+{UNKNOWN}"
+        return f"{pypto_version()}+{UNKNOWN}"
 
 
 def compute_params_fingerprint(
@@ -141,99 +106,3 @@ def compute_params_fingerprint(
         digest.update(str(tuple(arg.shape)).encode())
         digest.update(str(arg.dtype).encode())
     return digest.hexdigest()[:16]
-
-
-class KernelCache:
-    """Load/store compiled kernels under a cache directory (one slot per name)."""
-
-    def __init__(self, cache_dir: str, code_fingerprint: str) -> None:
-        self._cache_dir = Path(cache_dir)
-        self._code_fingerprint = code_fingerprint
-
-    def _marker(self, params_fingerprint: str) -> str:
-        return f"{self._code_fingerprint}|{params_fingerprint}"
-
-    def _usable(self, params_fingerprint: str) -> bool:
-        # A failed probe leaves UNKNOWN in the marker. Two UNKNOWN markers must
-        # not compare equal (that could HIT genuinely different code), so an
-        # unusable fingerprint forces a MISS and a no-op store.
-        return UNKNOWN not in self._marker(params_fingerprint)
-
-    def load(
-        self,
-        name: str,
-        params_fingerprint: str,
-        *,
-        platform: str,
-        distributed_config: Any,
-    ) -> object | None:
-        """Reload a compiled kernel from its slot, or ``None`` on miss/stale/error.
-
-        On a HIT the returned program's ``output_dir`` is the cache slot itself,
-        so the L3 worker reuses the cached device binaries and skips recompiling.
-        """
-        if not self._usable(params_fingerprint):
-            logger.info("[kernel-cache] MISS: %s fingerprint unavailable; compiling", name)
-            return None
-        try:
-            from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
-
-            slot = self._cache_dir / name
-            if not (slot / META_FILE).exists():
-                logger.info("[kernel-cache] MISS: %s not cached under %s; compiling", name, slot)
-                return None
-            marker_path = slot / FINGERPRINT_FILE
-            cached = marker_path.read_text().strip() if marker_path.exists() else None
-            current = self._marker(params_fingerprint)
-            if cached != current:
-                logger.info(
-                    "[kernel-cache] STALE: %s cached %r != current %r; recompiling",
-                    name, cached, current,
-                )
-                return None
-            compiled = DistributedCompiledProgram.from_dir(
-                str(slot), platform=platform, distributed_config=distributed_config,
-            )
-            logger.info("[kernel-cache] HIT: reused %s from %s", name, slot)
-            return compiled
-        except Exception as exc:  # noqa: BLE001 - reuse must never be fatal
-            logger.warning(
-                "[kernel-cache] reuse of %s failed (%s: %s); recompiling",
-                name, type(exc).__name__, exc,
-            )
-            return None
-
-    def store(self, name: str, compiled: Any, params_fingerprint: str) -> None:
-        """Persist a freshly-compiled kernel's build dir into its slot.
-
-        Overwrites any existing slot, so only the latest copy is kept. No-op
-        when the build dir already IS the slot (reused from cache) or when the
-        fingerprint is unavailable. Best-effort: a failure is logged, never
-        raised.
-        """
-        if not self._usable(params_fingerprint):
-            return
-        try:
-            slot = self._cache_dir / name
-            src = Path(str(compiled.output_dir))
-            if src.resolve() == slot.resolve():
-                return  # reused from cache -> already stored
-            if not src.exists():
-                logger.warning("[kernel-cache] build dir missing for %s; not cached", name)
-                return
-            slot.parent.mkdir(parents=True, exist_ok=True)
-            # Stage into a process-unique temp dir, then swap it in with a single
-            # rename: a crash mid-copy (or a concurrent writer) leaves only the
-            # .tmp dir, never a half-written slot that would later pass the meta
-            # check but fail from_dir. A re-store also self-heals a corrupt slot.
-            tmp = slot.with_name(f"{name}.tmp.{os.getpid()}")
-            if tmp.exists():
-                shutil.rmtree(tmp)
-            shutil.copytree(src, tmp)
-            (tmp / FINGERPRINT_FILE).write_text(self._marker(params_fingerprint))
-            if slot.exists():
-                shutil.rmtree(slot)
-            os.replace(tmp, slot)
-            logger.info("[kernel-cache] STORED: %s (+ device binaries) -> %s", name, slot)
-        except Exception as exc:  # noqa: BLE001 - caching must never be fatal
-            logger.warning("[kernel-cache] failed to store %s (%s: %s)", name, type(exc).__name__, exc)

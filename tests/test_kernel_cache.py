@@ -13,6 +13,7 @@ compiler: fake tensors stand in for the compile-time dummy args, and a fake
 ``DistributedCompiledProgram`` stands in for the reload path.
 """
 
+import ctypes
 import sys
 import types
 
@@ -24,6 +25,9 @@ from pypto_serving.model.qwen.kernel_cache import (
     KernelCache,
     canonical_source,
     compute_params_fingerprint,
+)
+from pypto_serving.model.deepseek.kernel_cache import (
+    compute_params_fingerprint as compute_deepseek_params_fingerprint,
 )
 
 
@@ -109,6 +113,23 @@ def test_params_fingerprint_tracks_every_distinguishing_dimension():
     assert base != _pf("decode_fwd", [_FakeTensor((16, 512), "float32")])
     assert base != _pf("decode_fwd", args, platform="a2a3sim")
     assert base != _pf("prefill_fwd", args)
+
+
+def test_deepseek_params_fingerprint_tracks_scalar_values():
+    args = [_FakeTensor((8, 512)), ctypes.c_int32(8)]
+    base = compute_deepseek_params_fingerprint(
+        "deepseek_v4_mtp_decode",
+        args,
+        platform="a2a3",
+        block_dim=None,
+    )
+    changed = compute_deepseek_params_fingerprint(
+        "deepseek_v4_mtp_decode",
+        [_FakeTensor((8, 512)), ctypes.c_int32(128)],
+        platform="a2a3",
+        block_dim=None,
+    )
+    assert base != changed
 
 
 # --- AST-canonical source hashing -----------------------------------------

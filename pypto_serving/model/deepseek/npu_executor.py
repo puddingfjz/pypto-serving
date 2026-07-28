@@ -419,16 +419,27 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         mtp_prefill = None
         freqs_cos = freqs_sin = None
         if self._compile_kernels:
-            modules = self._load_kernel_modules(layout)
+            with profile_span("DeepSeekV4PyptoExecutor.load_kernel_modules", cat="executor"):
+                modules = self._load_kernel_modules(layout)
+            with profile_span(
+                "DeepSeekV4PyptoExecutor.prepare_dummy_args.deepseek_v4_prefill",
+                cat="executor",
+            ):
+                prefill_args = self._prefill_dummy_args(model, layout, modules["config"])
             prefill = self._compile_l3_callable(
                 "deepseek_v4_prefill",
                 modules["prefill_fwd"].l3_prefill_fwd,
-                self._prefill_dummy_args(model, layout, modules["config"]),
+                prefill_args,
             )
+            with profile_span(
+                "DeepSeekV4PyptoExecutor.prepare_dummy_args.deepseek_v4_decode",
+                cat="executor",
+            ):
+                decode_args = self._decode_dummy_args(model, layout, modules["config"])
             decode = self._compile_l3_callable(
                 "deepseek_v4_decode",
                 modules["decode_fwd"].l3_decode_fwd,
-                self._decode_dummy_args(model, layout, modules["config"]),
+                decode_args,
             )
             if self._enable_mtp:
                 mtp_prefill = self._compile_l3_callable(
@@ -447,7 +458,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                         num_tokens=layout.decode_tokens,
                     ),
                 )
-            freqs_cos, freqs_sin = self._build_rope_tables(modules["rope_tables"], modules["config"])
+            with profile_span("DeepSeekV4PyptoExecutor.build_rope_tables", cat="executor"):
+                freqs_cos, freqs_sin = self._build_rope_tables(modules["rope_tables"], modules["config"])
 
         return DeepSeekV4CompiledKernels(
             layout=layout,
@@ -525,19 +537,36 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         args: list[Any] = []
         pypto_root = self._kernel_dir.parents[2]
         is_prefill = getattr(mtp_module, "__name__", "") == "prefill_mtp"
-        with _deepseek_v4_import_context(
-            self._kernel_dir,
-            pypto_root=pypto_root,
-            ep=len(self._device_ids),
-            lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
-            moe_shape="prefill" if is_prefill else "decode",
-            num_layers=DEEPSEEK_V4_FWD_NUM_LAYERS if is_prefill else None,
+        program = "deepseek_v4_mtp_prefill" if is_prefill else "deepseek_v4_mtp_decode"
+        with profile_span(
+            f"DeepSeekV4PyptoExecutor.prepare_dummy_args.{program}",
+            cat="executor",
+            args={"num_tokens": num_tokens},
         ):
-            for spec in mtp_module.build_tensor_specs(num_tokens=num_tokens):
-                if spec.name == "num_tokens":
-                    args.append(self._int32_arg(num_tokens))
-                else:
-                    args.append(torch.empty(tuple(spec.shape), dtype=spec.dtype))
+            with _deepseek_v4_import_context(
+                self._kernel_dir,
+                pypto_root=pypto_root,
+                ep=len(self._device_ids),
+                lm_head_tp=DEEPSEEK_V4_LM_HEAD_TP_SIZE,
+                moe_shape="prefill" if is_prefill else "decode",
+                num_layers=DEEPSEEK_V4_FWD_NUM_LAYERS if is_prefill else None,
+            ):
+                with profile_span(
+                    f"DeepSeekV4PyptoExecutor.build_tensor_specs.{program}",
+                    cat="executor",
+                    args={"num_tokens": num_tokens},
+                ):
+                    specs = tuple(mtp_module.build_tensor_specs(num_tokens=num_tokens))
+                with profile_span(
+                    f"DeepSeekV4PyptoExecutor.materialize_dummy_args.{program}",
+                    cat="executor",
+                    args={"tensor_count": len(specs)},
+                ):
+                    for spec in specs:
+                        if spec.name == "num_tokens":
+                            args.append(self._int32_arg(num_tokens))
+                        else:
+                            args.append(torch.empty(tuple(spec.shape), dtype=spec.dtype))
         return tuple(args)
 
     def _compile_l3_callable(self, name: str, jit_fn: object, dummy_args: Sequence[Any]) -> DeepSeekV4L3Callable:

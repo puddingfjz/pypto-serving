@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -396,6 +397,51 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert decode_args[decode_order.index("swa_lens")].shape == (8, 8)
     assert decode_args[decode_order.index("window_swa_indices")].shape == (8, 8, 128)
     assert decode_args[decode_order.index("window_swa_lens")].shape == (8, 8)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "program"),
+    [
+        ("prefill_mtp", "deepseek_v4_mtp_prefill"),
+        ("decode_mtp", "deepseek_v4_mtp_decode"),
+    ],
+)
+def test_deepseek_mtp_dummy_args_profile_spec_build_and_materialization(
+    tmp_path,
+    monkeypatch,
+    module_name,
+    program,
+):
+    spans: list[tuple[str, dict[str, int] | None]] = []
+
+    def _record_span(name, *, cat, args=None):
+        assert cat == "executor"
+        spans.append((name, args))
+        return nullcontext()
+
+    module = SimpleNamespace(
+        __name__=module_name,
+        build_tensor_specs=lambda *, num_tokens: (
+            SimpleNamespace(name="hidden_states", shape=(num_tokens, 8), dtype=torch.bfloat16),
+            SimpleNamespace(name="num_tokens", shape=(), dtype=torch.int32),
+        ),
+    )
+    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
+    executor._kernel_dir = tmp_path / "models" / "deepseek" / "v4-flash"
+    executor._device_ids = tuple(range(8))
+    monkeypatch.setattr(npu_executor, "profile_span", _record_span)
+    monkeypatch.setattr(npu_executor, "_deepseek_v4_import_context", lambda *args, **kwargs: nullcontext())
+
+    args = executor._mtp_dummy_args(module, num_tokens=4)
+
+    assert args[0].shape == (4, 8)
+    assert args[0].dtype == torch.bfloat16
+    assert args[1].value == 4
+    assert spans == [
+        (f"DeepSeekV4PyptoExecutor.prepare_dummy_args.{program}", {"num_tokens": 4}),
+        (f"DeepSeekV4PyptoExecutor.build_tensor_specs.{program}", {"num_tokens": 4}),
+        (f"DeepSeekV4PyptoExecutor.materialize_dummy_args.{program}", {"tensor_count": 2}),
+    ]
 
 
 def test_deepseek_kernel_contract_rejects_config_dimension_mismatch(tmp_path):

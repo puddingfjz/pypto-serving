@@ -36,8 +36,10 @@ from pypto_serving.model.deepseek.npu_runner import (
     deepseek_v4_cache_blocks_for_slots,
 )
 from pypto_serving.model.deepseek.weight_loader import (
+    DEEPSEEK_V4_PACKED_FORMAT,
     DeepSeekV4WeightStore,
     deepseek_v4_layer_core_weight_names,
+    deepseek_v4_packed_weights_path,
     deepseek_v4_hadamard_idx,
     deepseek_v4_local_expert_ids,
     deepseek_v4_routed_expert_weight_names,
@@ -480,6 +482,73 @@ def test_deepseek_weight_store_reads_real_safetensors_by_name(tmp_path):
     loaded = store.load_tensor("embed.weight")
 
     assert loaded.tolist() == [[0.0, 1.0], [2.0, 3.0]]
+
+
+def test_deepseek_weight_store_maps_valid_prepacked_sidecar(tmp_path, monkeypatch, caplog):
+    from safetensors.torch import save_file
+
+    shard_path = tmp_path / "model-00001-of-00001.safetensors"
+    shard_path.write_bytes(b"source-checkpoint")
+    store = DeepSeekV4WeightStore(
+        model_dir=tmp_path,
+        weight_map={"source.weight": shard_path.name},
+    )
+    params = {
+        "ranks": 2,
+        "n_routed_experts": 4,
+        "compress_ratios": (4,),
+        "num_hash_layers": 1,
+    }
+    fingerprint = store.packed_stacked_layer_weights_fingerprint(**params)
+    expected = {
+        name: torch.arange(2, dtype=torch.float32).reshape(2, 1)
+        for name in weight_loader._DEEPSEEK_V4_PACKED_WEIGHT_NAMES
+    }
+    save_file(
+        expected,
+        str(deepseek_v4_packed_weights_path(tmp_path, ranks=2)),
+        metadata={
+            "format": DEEPSEEK_V4_PACKED_FORMAT,
+            "source_fingerprint": fingerprint,
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "load_packed_layer_weights",
+        lambda *args, **kwargs: pytest.fail("valid sidecar must skip checkpoint packing"),
+    )
+
+    packed = store.load_stacked_layer_weights(**params)
+
+    assert packed.tensors.keys() == expected.keys()
+    assert all(torch.equal(packed.tensors[name], tensor) for name, tensor in expected.items())
+
+    shard_path.write_bytes(b"changed-source-checkpoint")
+    caplog.set_level("WARNING")
+    assert store.load_prepacked_stacked_layer_weights(**params) is None
+    assert "Ignoring stale DeepSeekV4 packed weights sidecar" in caplog.text
+
+
+def test_deepseek_weight_store_skips_cold_prepacked_sidecar(tmp_path, monkeypatch, caplog):
+    shard_path = tmp_path / "model-00001-of-00001.safetensors"
+    shard_path.write_bytes(b"source-checkpoint")
+    store = DeepSeekV4WeightStore(
+        model_dir=tmp_path,
+        weight_map={"source.weight": shard_path.name},
+    )
+    deepseek_v4_packed_weights_path(tmp_path, ranks=2).write_bytes(b"not-opened")
+    monkeypatch.setattr(weight_loader, "_sample_file_page_cache_residency", lambda path: 0.5)
+    caplog.set_level("INFO")
+
+    packed = store.load_prepacked_stacked_layer_weights(
+        ranks=2,
+        n_routed_experts=4,
+        compress_ratios=(4,),
+        num_hash_layers=1,
+    )
+
+    assert packed is None
+    assert "Skipping cold DeepSeekV4 packed weights sidecar" in caplog.text
 
 
 def test_deepseek_executor_lazily_loads_and_caches_embeddings(tmp_path):

@@ -32,6 +32,24 @@ handles and address them with scheduler-owned group block IDs; there is no
 prefill CPU snapshot or cache handoff. Reassigned pages are cleared with
 targeted host-to-device copies before their new owner writes them.
 
+## Optional Prepacked Weights
+
+The 43 hidden layers can be converted once into the final rank-stacked Host
+layout:
+
+```bash
+pypto-prepack-deepseek-v4 /data/models/dsv4-flash-w8a8
+```
+
+The command atomically writes
+`pypto-deepseek-v4-stacked-r8.safetensors` beside the checkpoint. Subsequent
+starts sample its Linux page-cache residency before opening it. A hot sidecar is
+validated against the checkpoint-file and deployment fingerprint, then
+memory-mapped as the final layout instead of repacking every hidden layer. A
+cold, missing, or stale sidecar uses the original checkpoint path, avoiding a
+cold 323 GiB page-fault stream on the weight-upload path. Rebuild with `--force`
+after replacing checkpoint shards or changing the packed rank layout.
+
 ## Completion Check
 
 Check server health first:

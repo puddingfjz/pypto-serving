@@ -9,7 +9,12 @@
 
 from __future__ import annotations
 
+import ctypes
+import hashlib
+import json
 import logging
+import mmap
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,6 +107,10 @@ _DEEPSEEK_V4_ATTENTION_OUT = 64 * 512
 _DEEPSEEK_V4_N_ROUTED_EXPERTS = 256
 _DEEPSEEK_V4_TOPK = 6
 _DEEPSEEK_V4_VOCAB_SIZE = 129280
+DEEPSEEK_V4_PACKED_FORMAT = "pypto-deepseek-v4-stacked-v1"
+_PREPACKED_CACHE_SAMPLE_WINDOWS = 64
+_PREPACKED_CACHE_SAMPLE_BYTES = 4 * 1024 * 1024
+_PREPACKED_MIN_CACHE_RESIDENCY = 0.95
 
 
 def _default_safe_open(path: Path, device: str) -> ContextManager[_SafeTensorReader]:
@@ -183,6 +192,113 @@ DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES = (
     "hca_cmp_ape",
     "hca_cmp_norm_w",
 )
+_DEEPSEEK_V4_RANK_REPLICATED_WEIGHT_NAMES = frozenset(
+    {
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_attn_base",
+        "attn_norm_w",
+        "wq_a",
+        "wq_b",
+        "wq_b_scale",
+        "wkv",
+        "gamma_cq",
+        "gamma_ckv",
+        "attn_sink",
+        "wo_a",
+        "wo_b",
+        "wo_b_scale",
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+        "hc_ffn_base",
+        "norm_w",
+        "gate_w",
+        "shared_w1",
+        "shared_w1_scale",
+        "shared_w3",
+        "shared_w3_scale",
+        "shared_w2",
+        "shared_w2_scale",
+        "gate_bias",
+        "tid2eid",
+        *DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES,
+        *DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES,
+    }
+)
+_DEEPSEEK_V4_EP_SHARDED_WEIGHT_NAMES = frozenset(
+    {
+        "routed_w1",
+        "routed_w1_scale",
+        "routed_w2",
+        "routed_w2_scale",
+        "routed_w3",
+        "routed_w3_scale",
+    }
+)
+_DEEPSEEK_V4_PACKED_WEIGHT_NAMES = (
+    _DEEPSEEK_V4_RANK_REPLICATED_WEIGHT_NAMES | _DEEPSEEK_V4_EP_SHARDED_WEIGHT_NAMES
+)
+
+
+def deepseek_v4_packed_weights_path(model_dir: str | Path, *, ranks: int) -> Path:
+    """Return the default sidecar path for prepacked hidden-layer weights."""
+    return Path(model_dir) / f"pypto-deepseek-v4-stacked-r{int(ranks)}.safetensors"
+
+
+def _sample_file_page_cache_residency(path: Path) -> float | None:
+    """Estimate Linux page-cache residency without reading the sampled pages."""
+    fd = os.open(path, os.O_RDONLY)
+    mapping: mmap.mmap | None = None
+    anchor: ctypes.c_char | None = None
+    try:
+        size = os.fstat(fd).st_size
+        if size <= 0:
+            return 0.0
+        mapping = mmap.mmap(fd, size, access=mmap.ACCESS_COPY)
+        anchor = ctypes.c_char.from_buffer(mapping)
+        base_address = ctypes.addressof(anchor)
+        page_size = mmap.PAGESIZE
+        sample_bytes = min(size, _PREPACKED_CACHE_SAMPLE_BYTES)
+        if size <= _PREPACKED_CACHE_SAMPLE_WINDOWS * sample_bytes:
+            offsets = (0,)
+            sample_bytes = size
+        else:
+            last_offset = size - sample_bytes
+            offsets = tuple(
+                ((index * last_offset // (_PREPACKED_CACHE_SAMPLE_WINDOWS - 1)) // page_size)
+                * page_size
+                for index in range(_PREPACKED_CACHE_SAMPLE_WINDOWS)
+            )
+
+        mincore = ctypes.CDLL(None, use_errno=True).mincore
+        mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_ubyte))
+        mincore.restype = ctypes.c_int
+        resident_pages = 0
+        sampled_pages = 0
+        for offset in offsets:
+            length = min(sample_bytes, size - offset)
+            page_count = (length + page_size - 1) // page_size
+            residency = (ctypes.c_ubyte * page_count)()
+            if mincore(
+                ctypes.c_void_p(base_address + offset),
+                ctypes.c_size_t(length),
+                residency,
+            ):
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error), path)
+            resident_pages += sum(value & 1 for value in residency)
+            sampled_pages += page_count
+        return resident_pages / sampled_pages
+    except (AttributeError, OSError, ValueError):
+        logger.warning("Could not inspect page-cache residency for %s", path, exc_info=True)
+        return None
+    finally:
+        anchor = None
+        if mapping is not None:
+            mapping.close()
+        os.close(fd)
+
+
 @dataclass(frozen=True)
 class DeepSeekV4StackedLayerWeights:
     """All hidden-layer weights stacked on the layer axis for ``l3_decode_fwd``.
@@ -632,6 +748,104 @@ class DeepSeekV4WeightStore:
             destinations=destinations,
         )
 
+    def packed_stacked_layer_weights_fingerprint(
+        self,
+        *,
+        ranks: int,
+        n_routed_experts: int,
+        compress_ratios: Sequence[int],
+        num_hash_layers: int,
+    ) -> str:
+        """Return the source/deployment fingerprint for a packed-weight sidecar."""
+        source_files = []
+        for filename in sorted(set(self.weight_map.values())):
+            stat = (self.model_dir / filename).stat()
+            source_files.append((filename, stat.st_size, stat.st_mtime_ns))
+        payload = {
+            "format": DEEPSEEK_V4_PACKED_FORMAT,
+            "ranks": int(ranks),
+            "n_routed_experts": int(n_routed_experts),
+            "compress_ratios": [int(value) for value in compress_ratios],
+            "num_hash_layers": int(num_hash_layers),
+            "weight_map": sorted(self.weight_map.items()),
+            "source_files": source_files,
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def load_prepacked_stacked_layer_weights(
+        self,
+        *,
+        ranks: int,
+        n_routed_experts: int,
+        compress_ratios: Sequence[int],
+        num_hash_layers: int,
+        path: str | Path | None = None,
+    ) -> DeepSeekV4StackedLayerWeights | None:
+        """Map a valid prepacked sidecar, or return ``None`` when none is usable."""
+        packed_path = (
+            deepseek_v4_packed_weights_path(self.model_dir, ranks=ranks)
+            if path is None
+            else Path(path)
+        )
+        if not packed_path.is_file():
+            return None
+        cache_residency = _sample_file_page_cache_residency(packed_path)
+        if cache_residency is None or cache_residency < _PREPACKED_MIN_CACHE_RESIDENCY:
+            logger.info(
+                "Skipping cold DeepSeekV4 packed weights sidecar %s "
+                "(sampled page-cache residency %.1f%%; requires %.1f%%)",
+                packed_path,
+                0.0 if cache_residency is None else 100.0 * cache_residency,
+                100.0 * _PREPACKED_MIN_CACHE_RESIDENCY,
+            )
+            return None
+        try:
+            from safetensors import safe_open
+        except ImportError as exc:
+            raise RuntimeError("safetensors is required to read DeepSeekV4 W8A8 weights.") from exc
+
+        expected_fingerprint = self.packed_stacked_layer_weights_fingerprint(
+            ranks=ranks,
+            n_routed_experts=n_routed_experts,
+            compress_ratios=compress_ratios,
+            num_hash_layers=num_hash_layers,
+        )
+        with safe_open(str(packed_path), framework="pt", device="cpu") as reader:
+            metadata = reader.metadata() or {}
+            if (
+                metadata.get("format") != DEEPSEEK_V4_PACKED_FORMAT
+                or metadata.get("source_fingerprint") != expected_fingerprint
+            ):
+                logger.warning(
+                    "Ignoring stale DeepSeekV4 packed weights sidecar: %s",
+                    packed_path,
+                )
+                return None
+            names = frozenset(reader.keys())
+            if names != _DEEPSEEK_V4_PACKED_WEIGHT_NAMES:
+                missing = sorted(_DEEPSEEK_V4_PACKED_WEIGHT_NAMES - names)
+                extra = sorted(names - _DEEPSEEK_V4_PACKED_WEIGHT_NAMES)
+                raise ValueError(
+                    f"DeepSeekV4 packed weights sidecar {packed_path} has invalid tensor names; "
+                    f"missing={missing}, extra={extra}"
+                )
+            tensors = {name: reader.get_tensor(name) for name in names}
+
+        for name, tensor in tensors.items():
+            if tensor.device.type != "cpu" or not tensor.is_contiguous():
+                raise ValueError(
+                    f"DeepSeekV4 packed weight {name} must be a contiguous CPU tensor, "
+                    f"got device={tensor.device} shape={tuple(tensor.shape)}"
+                )
+            if tensor.ndim < 2 or int(tensor.shape[0]) != int(ranks):
+                raise ValueError(
+                    f"DeepSeekV4 packed weight {name} must have leading rank dimension {ranks}, "
+                    f"got shape={tuple(tensor.shape)}"
+                )
+        logger.info("Mapped prepacked DeepSeekV4 layer weights from %s", packed_path)
+        return DeepSeekV4StackedLayerWeights(tensors=tensors)
+
     def load_stacked_layer_weights(
         self,
         *,
@@ -639,6 +853,7 @@ class DeepSeekV4WeightStore:
         n_routed_experts: int,
         compress_ratios: Sequence[int],
         num_hash_layers: int,
+        use_prepacked: bool = True,
     ) -> DeepSeekV4StackedLayerWeights:
         """Load every hidden layer once and stack weights on the layer axis.
 
@@ -658,6 +873,15 @@ class DeepSeekV4WeightStore:
         num_hidden_layers = len(compress_ratios)
         if num_hidden_layers <= 0:
             raise ValueError("compress_ratios must include at least one entry per hidden layer")
+        if use_prepacked:
+            prepacked = self.load_prepacked_stacked_layer_weights(
+                ranks=ranks,
+                n_routed_experts=n_routed_experts,
+                compress_ratios=compress_ratios,
+                num_hash_layers=num_hash_layers,
+            )
+            if prepacked is not None:
+                return prepacked
         first = self.load_packed_layer_weights(
             0,
             ranks=ranks,

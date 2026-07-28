@@ -1048,6 +1048,7 @@ class DeepSeekV4CompiledKernels:
     compress_ratios: tuple[int, ...]
     layer_plan: tuple["DeepSeekV4LayerPlan", ...]
     kernel_dir: str
+    prepacked_layer_weights: DeepSeekV4StackedLayerWeights | None = None
     runtime_model: RuntimeModel | None = None
     prefill: DeepSeekV4L3Callable | None = None
     decode: DeepSeekV4L3Callable | None = None
@@ -1608,12 +1609,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def load_stacked_layer_weights(self) -> DeepSeekV4StackedLayerWeights:
         """Load and stack all hidden-layer weights for the packed decode_fwd kernel."""
+        if self._compiled.prepacked_layer_weights is not None:
+            return self._compiled.prepacked_layer_weights
         compress_ratios = tuple(int(layer.compress_ratio) for layer in self._compiled.layer_plan)
         return self._compiled.weight_store.load_stacked_layer_weights(
             ranks=self._compiled.layout.ranks,
             n_routed_experts=self._compiled.n_routed_experts,
             compress_ratios=compress_ratios,
             num_hash_layers=self._compiled.num_hash_layers,
+            use_prepacked=False,
         )
 
     def load_mtp_weights(self) -> DeepSeekV4MtpWeights:

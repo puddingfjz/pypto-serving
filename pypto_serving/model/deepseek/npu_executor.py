@@ -49,9 +49,11 @@ from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_FWD_NUM_LAYERS,
     DEEPSEEK_V4_HCA_NUM_LAYERS,
 )
-from pypto_serving.model.deepseek.weight_loader import DeepSeekV4WeightStore
+from pypto_serving.model.deepseek.weight_loader import (
+    DeepSeekV4StackedLayerWeights,
+    DeepSeekV4WeightStore,
+)
 from pypto_serving.tools.profile import profile_span
-
 
 _AST_INT_OPERATORS = {
     ast.Add: operator.add,
@@ -415,6 +417,16 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         if self._enable_mtp:
             weight_store.validate_mtp_startup_contract(n_routed_experts=n_routed_experts)
 
+        layer_compress_ratios = tuple(layer.compress_ratio for layer in layer_plan)
+        prepacked_layer_weights: DeepSeekV4StackedLayerWeights | None = None
+        if self._compile_kernels:
+            prepacked_layer_weights = weight_store.load_prepacked_stacked_layer_weights(
+                ranks=layout.ranks,
+                n_routed_experts=n_routed_experts,
+                compress_ratios=layer_compress_ratios,
+                num_hash_layers=num_hash_layers,
+            )
+
         prefill = None
         decode = None
         mtp_decode = None
@@ -453,13 +465,17 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                         num_tokens=layout.decode_tokens,
                     ),
                 )
-            freqs_cos, freqs_sin = self._build_rope_tables(modules["rope_tables"], modules["config"])
+            freqs_cos, freqs_sin = self._build_rope_tables(
+                modules["rope_tables"],
+                modules["config"],
+            )
 
         return DeepSeekV4CompiledKernels(
             layout=layout,
             model_dir=str(metadata["model_dir"]),
             weight_map=weight_map,
             weight_store=weight_store,
+            prepacked_layer_weights=prepacked_layer_weights,
             compress_ratios=compress_ratios,
             layer_plan=layer_plan,
             kernel_dir=str(self._kernel_dir),

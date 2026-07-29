@@ -128,6 +128,64 @@ Linux `mincore()` sample prevents a cold sidecar from turning upload into
 random page faults: when fewer than 95 percent of sampled pages are resident,
 startup uses the original checkpoint loader. The gate took about 0.02 seconds.
 
+### Combined Experiment
+
+Commit `d0cef65` combines signature-only compilation, the persistent callable
+cache, and the prepacked weight sidecar. The merge also fingerprints cache
+entries from the evaluated JIT function signature and scalar arguments, so a
+cache lookup does not reconstruct the deleted dummy tensors.
+
+Four launches covered cache publication, a warm cache with a cold sidecar, and
+two warm-cache/hot-sidecar repetitions:
+
+| Cache and sidecar state | Devices | Registration (s) | Layer load + pack (s) | Worker (s) | Main upload (s) | MTP upload (s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Miss + publish, cold sidecar fallback | `0,2,4,6,8,10,12,14` | 349.297 | 95.924 | 139.722 | 25.914 | 1.037 |
+| Hit, cold sidecar fallback | `0,2,4,6,8,10,12,14` | 276.206 | 223.768 | 3.459 | 25.010 | 0.882 |
+| Hit, hot sidecar, run 1 | `0,1,2,3,4,5,6,7` | 94.058 | 0.000 | 3.990 | 53.879 | 1.227 |
+| Hit, hot sidecar, run 2 | `0,1,2,3,4,5,6,7` | 87.133 | 0.000 | 3.128 | 58.795 | 0.813 |
+
+The two hot repetitions averaged **90.595 seconds**, which is 416.163 seconds
+or 82.1 percent below the 506.758-second control (5.59x as fast). Their trace
+directories are
+`/tmp/pypto-serving-deepseek-combined-hit-hot-1-d0-7-20260729` and
+`/tmp/pypto-serving-deepseek-combined-hit-hot-2-d0-7-20260729`.
+
+The cache-miss launch includes copying four complete callable output trees into
+the cache. That publication work and shared-machine load increased worker
+construction to 139.722 seconds, so it is not a steady-state result. The
+cache-hit/cold-sidecar launch proves the cache path but is also not a clean
+absolute comparison: concurrent Host work stretched layer packing from the
+control's 90.642 seconds to 223.768 seconds. Its compile spans disappeared and
+worker construction fell to 3.459 seconds.
+
+All four launches completed resident-weight upload, then exited while sizing
+the KV cache because residual device allocations left about 6.2 GB free on
+device 0. The 90 percent HBM budget could not fit one additional 312.7 MB cache
+slot. `PyptoExecutor.register_model` closes its trace span on this exception,
+so the startup intervals above are complete, but these launches do not replace
+an end-to-end generation correctness test.
+
+Warming the sidecar was itself expensive under concurrent machine load. A
+sequential read of all 322.818 GiB took 577.710 seconds and left 92.383 percent
+sampled residency because other workloads reclaimed pages during the read. A
+second pass took 155.860 seconds, after which `fincore` reported all
+84,624,906 pages resident. These costs are not included in hot-start time; the
+sidecar optimization requires an already resident file and deliberately falls
+back otherwise.
+
+The hot sidecar also explains why main upload is slower than the control.
+`safe_open().get_tensor()` returns tensors backed by a lazy file mapping.
+`mincore()` proves that file contents are in the Linux page cache, but it does
+not install this process's page-table entries or prefault/pin every page for
+the device copy. The first `alloc_stacked_tensor()` upload therefore touches
+roughly 84.6 million 4 KiB pages and pays minor-fault and mapping/pinning
+overhead. The original pack path has already written every anonymous
+destination page, so its mappings are hot before upload. This moves main
+upload from about 25 seconds to 50--59 seconds, but avoiding roughly 91 seconds
+of packing still gives a net startup improvement. A separate prefault pass
+would only move that cost unless it can safely overlap other startup work.
+
 The following experiments were rejected and left no code branch:
 
 - Four-way blind shard prefetch read 270 of 347 GB in 294.689 seconds before
